@@ -208,6 +208,12 @@ function pointerDown(evt) {
             nMouseOffsetY += TOUCH_DRAG_LIFT;
         }
 
+        // Promote the dragged pile to its own compositor layer for the
+        // duration of the drag. Without this the browser can re-rasterize
+        // the cards (heavy for the image-based decks) on every frame of
+        // movement, which reads as choppy dragging on phones.
+        target.style.willChange = "transform";
+
         if (dragStartCallbacks.length) {
             const dragEvt = new DragEvent(
                 evt, 
@@ -235,6 +241,32 @@ function pointerDown(evt) {
     evt.stopPropagation();
 }
 
+// Drag positions are applied at most once per animation frame. Touch digitizers
+// can emit pointermove far faster than the screen refreshes (90-120Hz+), and
+// synchronously re-writing the transform for every event just queues extra
+// invalidations that make the drag feel choppy on phones.
+let nPendingDragX = null;
+let nPendingDragY = null;
+let gDragRafId = 0;
+
+function applyPendingDragTransform() {
+    gDragRafId = 0;
+    if (draggingElement && nPendingDragX !== null) {
+        draggingElement.setAttribute("transform", `translate(${nPendingDragX},${nPendingDragY})`);
+        nPendingDragX = null;
+        nPendingDragY = null;
+    }
+}
+
+function clearPendingDragTransform() {
+    if (gDragRafId) {
+        cancelAnimationFrame(gDragRafId);
+        gDragRafId = 0;
+    }
+    nPendingDragX = null;
+    nPendingDragY = null;
+}
+
 function pointerMove(evt) {
     if (!draggingElement || !screenCTMInv) return;
     let p = document.documentElement.createSVGPoint();
@@ -251,7 +283,9 @@ function pointerMove(evt) {
     else if (right && p.x > right) p.x = right;
     if (top && p.y < top) p.y = top;
     else if (bottom && p.y > bottom) p.y = bottom;
-    draggingElement.setAttribute("transform", `translate(${p.x},${p.y})`);
+    nPendingDragX = p.x;
+    nPendingDragY = p.y;
+    if (!gDragRafId) gDragRafId = requestAnimationFrame(applyPendingDragTransform);
     if (dragMoveCallbacks.length){
         const dragEvt = new DragEvent(
             evt, 
@@ -276,6 +310,13 @@ let gPrimedCardHref = "";
 function pointerUp(evt) {
     if (window.getSelection) window.getSelection().removeAllRanges();
     if (!draggingElement) return;
+
+    // Apply any drag position still waiting on the next animation frame, so
+    // the drop logic below reads the true final transform.
+    if (gDragRafId) cancelAnimationFrame(gDragRafId);
+    applyPendingDragTransform();
+    clearPendingDragTransform();
+    draggingElement.style.willChange = "";
 
     // The tap-to-autoplay shortcut needs to identify the released card by its
     // href. On some (mostly mobile) browsers the pointerup can land on the
@@ -362,6 +403,8 @@ function pointerUp(evt) {
 function abortDrag(evt) {
     if (!draggingElement) return;
     const ele = draggingElement;
+    clearPendingDragTransform();
+    ele.style.willChange = "";
     try {
         if (evt && evt.pointerId != null) ele.releasePointerCapture(evt.pointerId);
     } catch (e) {}
