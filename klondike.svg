@@ -725,49 +725,94 @@ function cardNameOf(el) {
 
 function rasterizeDeck() {
     if (chosenDeck === "") return; // basic deck is inline vector art: already fast
-    // Match the card's real on-screen resolution, capped near the deck
-    // art's native resolution so we never waste memory upscaling.
-    const w = Math.max(121, Math.min(482,
-        Math.ceil(171 * (innerWidth / 2178.99) * (devicePixelRatio || 1))));
-    const h = Math.round(w * 335 / 241); // deck fragments are 241x335
-    const names = [gBackName];
-    for (let i = 0; i < gAllCards.length; ++i) names.push(gAllCards[i].elemName);
-    // This is an XML (SVG) document, so a plain createElement would not
-    // produce a real HTML canvas: create it in the XHTML namespace.
-    const canvas = document.createElementNS("http://www.w3.org/1999/xhtml", "canvas");
-    canvas.width = w;
-    canvas.height = h;
-    if (!canvas.getContext) return; // ancient browser: keep SVG hrefs
-    const ctx2d = canvas.getContext("2d");
-    if (!ctx2d) return;
-    let idx = 0;
-    function next() {
-        if (idx >= names.length) return;
-        const name = names[idx++];
-        const img = new Image();
-        img.onload = function() {
+    // NOTE: we deliberately never load "deck.svg#fragment" URLs here. WebKit
+    // caches one rendering of the SVG per resource and serves it for every
+    // fragment, so per-fragment rasterization captures the whole sheet on
+    // iOS Safari. Instead we load the sheet once and crop each card out of
+    // it using the <view> coordinates parsed from the deck itself.
+    fetch(chosenDeck).then(function(resp) { return resp.text(); }).then(function(text) {
+        const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+        const rootEl = doc.documentElement;
+        const vb = (rootEl.getAttribute("viewBox") || "").split(/\s+/).map(parseFloat);
+        if (vb.length !== 4 || !(vb[2] > 0) || !(vb[3] > 0)) return;
+        const rects = {};
+        const views = doc.getElementsByTagName("view");
+        for (let v = 0; v < views.length; ++v) {
+            const bx = (views[v].getAttribute("viewBox") || "").split(/\s+/).map(parseFloat);
+            if (bx.length === 4) rects[views[v].getAttribute("id")] = bx;
+        }
+        const names = [gBackName];
+        for (let i = 0; i < gAllCards.length; ++i) names.push(gAllCards[i].elemName);
+        const sample = rects[names[0].split("#")[1]];
+        if (!sample) return; // deck without card views: keep SVG hrefs
+        const cardW = sample[2];
+        const cardH = sample[3];
+        // Card size at real on-screen resolution, capped so the full sheet
+        // canvas stays under iOS Safari's ~16.7M pixel canvas area limit.
+        const desired = Math.max(121, Math.ceil(171 * (innerWidth / 2178.99) * (devicePixelRatio || 1)));
+        const maxW = Math.floor(cardW * Math.sqrt(16000000 / (vb[2] * vb[3])));
+        const w = Math.min(desired, maxW, 482);
+        const h = Math.round(w * cardH / cardW);
+        const scale = w / cardW;
+        const sheetW = Math.ceil(vb[2] * scale);
+        const sheetH = Math.ceil(vb[3] * scale);
+        // Give the sheet concrete pixel dimensions before loading: some
+        // browsers rasterize a dimensionless SVG at a tiny default size
+        // and then upscale it, which comes out blurry.
+        rootEl.setAttribute("width", sheetW);
+        rootEl.setAttribute("height", sheetH);
+        const blobUrl = URL.createObjectURL(
+            new Blob([new XMLSerializer().serializeToString(doc)], { type: "image/svg+xml" }));
+        const sheetImg = new Image();
+        sheetImg.onerror = function() { URL.revokeObjectURL(blobUrl); };
+        sheetImg.onload = function() {
+            // This is an XML (SVG) document, so plain createElement would
+            // not produce a real HTML canvas: use the XHTML namespace.
+            const XH = "http://www.w3.org/1999/xhtml";
+            const sheet = document.createElementNS(XH, "canvas");
+            sheet.width = sheetW;
+            sheet.height = sheetH;
+            if (!sheet.getContext) return;
+            const sctx = sheet.getContext("2d");
+            if (!sctx) return;
             try {
-                ctx2d.clearRect(0, 0, w, h);
-                ctx2d.drawImage(img, 0, 0, w, h);
-                canvas.toBlob(function(blob) {
-                    if (blob) {
-                        gRasterCache[name] = URL.createObjectURL(blob);
-                        // upgrade any copies of this card already on the table
-                        const shown = document.querySelectorAll('image[data-card="' + name + '"]');
-                        for (let n = 0; n < shown.length; ++n) {
-                            shown[n].setAttribute("href", gRasterCache[name]);
+                sctx.drawImage(sheetImg, 0, 0, sheetW, sheetH);
+            } catch (e) { return; } finally { URL.revokeObjectURL(blobUrl); }
+            const card = document.createElementNS(XH, "canvas");
+            card.width = w;
+            card.height = h;
+            const cctx = card.getContext("2d");
+            let idx = 0;
+            function next() {
+                if (idx >= names.length) return;
+                const name = names[idx++];
+                const r = rects[name.split("#")[1]];
+                if (!r) { setTimeout(next, 0); return; }
+                try {
+                    cctx.clearRect(0, 0, w, h);
+                    cctx.drawImage(sheet,
+                        (r[0] - vb[0]) * scale, (r[1] - vb[1]) * scale,
+                        r[2] * scale, r[3] * scale,
+                        0, 0, w, h);
+                    card.toBlob(function(blob) {
+                        if (blob) {
+                            gRasterCache[name] = URL.createObjectURL(blob);
+                            // upgrade any copies of this card already on the table
+                            const shown = document.querySelectorAll('image[data-card="' + name + '"]');
+                            for (let n = 0; n < shown.length; ++n) {
+                                shown[n].setAttribute("href", gRasterCache[name]);
+                            }
                         }
-                    }
-                    setTimeout(next, 0);
-                }, "image/png");
-            } catch (e) {
-                // canvas is tainted (e.g. opened from file://): keep SVG hrefs
+                        setTimeout(next, 0);
+                    }, "image/png");
+                } catch (e) {
+                    // canvas tainted or out of memory: keep SVG hrefs
+                }
             }
+            next();
         };
-        img.onerror = function() { setTimeout(next, 0); };
-        img.src = name;
-    }
-    next();
+        sheetImg.src = blobUrl;
+    }).catch(function() { /* fetch unavailable (e.g. file://): keep SVG hrefs */ });
 }
 // -----------------------------------------------------------------------
 
