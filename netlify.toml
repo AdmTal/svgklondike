@@ -1,0 +1,28 @@
+# Netlify hosting config.
+#
+# This repo was originally wired for Cloudflare Pages: functions/[[path]].js
+# (a Cloudflare Pages Function) rewrites "/" to the upstream author's build,
+# and index.html redirects to svgklondike.pages.dev. Neither is correct on
+# Netlify — the function never runs here, and the redirect sends visitors to
+# someone else's deployment. These rules make the site serve THIS repo's game.
+
+# Serve the interactive SVG game itself at the site root.
+# status 200 = rewrite (URL stays "/"); force = true so it wins over index.html.
+# Netlify gzip/brotli-compresses the response on the wire, so we serve the
+# plain klondike.svg and don't need the .svgz Content-Encoding dance.
+[[redirects]]
+  from = "/"
+  to = "/klondike.svg"
+  status = 200
+  force = true
+
+# Make sure the game and decks are served as interactive SVG documents.
+[[headers]]
+  for = "/klondike.svg"
+  [headers.values]
+    Content-Type = "image/svg+xml; charset=utf-8"
+
+[[headers]]
+  for = "/*.svg"
+  [headers.values]
+    Content-Type = "image/svg+xml; charset=utf-8"
