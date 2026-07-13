@@ -235,7 +235,7 @@ function pointerDown(evt) {
             }
 	    const title = document.querySelector("title");
 	    const dc = draggingElement.firstChild?draggingElement.firstChild:draggingElement;
-	    title.textContent = title.textContent.replace(/^./u, tca[dc.getAttribute("href").split('#')[1]]);
+	    title.textContent = title.textContent.replace(/^./u, tca[(cardNameOf(dc) || "").split('#')[1]]);
         }
     }
     evt.stopPropagation();
@@ -325,7 +325,7 @@ function pointerUp(evt) {
     // the engine with a floating card.
     const targetElement = evt.target;
     const currentHref = (targetElement && targetElement.tagName !== "svg")
-        ? targetElement.getAttribute("href")
+        ? cardNameOf(targetElement)
         : null;
 
     // Second click: If this href matches the one we primed on click one
@@ -702,6 +702,75 @@ Card.prototype.flip = function() {
 
 const CARD_VERT_OFFSET = 50;
 
+// --- Bitmap card cache -------------------------------------------------
+// The image decks (TalTech etc.) reference fragments of a large external
+// SVG whose card faces are photographic AVIFs. Some browsers (WebKit on
+// iOS in particular) re-render that SVG content on almost every
+// interaction, which makes the whole deck feel sluggish. So once the deal
+// is on the table we rasterize each card face to a plain PNG once, and
+// swap card <image>s over to those bitmaps: every later repaint becomes a
+// cheap bitmap blit. The logical card name is kept in data-card, which is
+// what the game logic reads (href may be a blob: URL).
+const gRasterCache = {};
+
+function setCardArt(el, name) {
+    el.setAttribute("data-card", name);
+    el.setAttribute("href", gRasterCache[name] || name);
+}
+
+function cardNameOf(el) {
+    if (!el || !el.getAttribute) return null;
+    return el.getAttribute("data-card") || el.getAttribute("href");
+}
+
+function rasterizeDeck() {
+    if (chosenDeck === "") return; // basic deck is inline vector art: already fast
+    // Match the card's real on-screen resolution, capped near the deck
+    // art's native resolution so we never waste memory upscaling.
+    const w = Math.max(121, Math.min(482,
+        Math.ceil(171 * (innerWidth / 2178.99) * (devicePixelRatio || 1))));
+    const h = Math.round(w * 335 / 241); // deck fragments are 241x335
+    const names = [gBackName];
+    for (let i = 0; i < gAllCards.length; ++i) names.push(gAllCards[i].elemName);
+    // This is an XML (SVG) document, so a plain createElement would not
+    // produce a real HTML canvas: create it in the XHTML namespace.
+    const canvas = document.createElementNS("http://www.w3.org/1999/xhtml", "canvas");
+    canvas.width = w;
+    canvas.height = h;
+    if (!canvas.getContext) return; // ancient browser: keep SVG hrefs
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) return;
+    let idx = 0;
+    function next() {
+        if (idx >= names.length) return;
+        const name = names[idx++];
+        const img = new Image();
+        img.onload = function() {
+            try {
+                ctx2d.clearRect(0, 0, w, h);
+                ctx2d.drawImage(img, 0, 0, w, h);
+                canvas.toBlob(function(blob) {
+                    if (blob) {
+                        gRasterCache[name] = URL.createObjectURL(blob);
+                        // upgrade any copies of this card already on the table
+                        const shown = document.querySelectorAll('image[data-card="' + name + '"]');
+                        for (let n = 0; n < shown.length; ++n) {
+                            shown[n].setAttribute("href", gRasterCache[name]);
+                        }
+                    }
+                    setTimeout(next, 0);
+                }, "image/png");
+            } catch (e) {
+                // canvas is tainted (e.g. opened from file://): keep SVG hrefs
+            }
+        };
+        img.onerror = function() { setTimeout(next, 0); };
+        img.src = name;
+    }
+    next();
+}
+// -----------------------------------------------------------------------
+
 function TableauPile(g) {
     if (!g) alert("TableauPile was initialized with a null <g> element");
     this.rootElem = g;
@@ -761,9 +830,9 @@ TableauPile.prototype.push = function(card) {
 	use.setAttribute("x", "-2");
     }
     if(card.isFaceUp()) {
-        use.setAttribute("href", card.elemName);
+        setCardArt(use, card.elemName);
     }else{
-        use.setAttribute("href", gBackName);
+        setCardArt(use, gBackName);
     }
     newg.appendChild(use);
     this.elem.appendChild(newg);
@@ -846,12 +915,12 @@ CardStack.prototype.push = function(card,allowDrag) {
 		use.setAttribute("x", "-2");
 	}
         if(card.isFaceUp()) {
-            use.setAttribute("href", card.elemName);
+            setCardArt(use, card.elemName);
             if(allowDrag) {
                 use.setAttribute("id", "waste_" + oldLength);
             }
         }else {
-            use.setAttribute("href", gBackName);
+            setCardArt(use, gBackName);
         }
         this.elem.appendChild(use);
         if(card.isFaceUp() && allowDrag) {
@@ -1083,10 +1152,14 @@ function highlight(dragFrom,dragTo) {
 	if(!dragTo) { // highlight the border of the deck to flip from it
 	    document.querySelector(dragFrom.elemName).setAttribute("data-highlight","back");
 	}else{ // highlight the face of the card to drag and of the target
-            const hlFrom = chosenDeck!=""?'image[href="' + dragFrom.elemName + '"]':dragFrom.elemName;
-            const hlTo = chosenDeck!=""?'image[href="' + dragTo.elemName + '"]':dragTo.elemName;
-	    document.querySelector(hlFrom).setAttribute("data-highlight","face");
-	    if(dragTo != "MT")document.querySelector(hlTo).setAttribute("data-highlight","face");
+            const hlFrom = chosenDeck!=""?'image[data-card="' + dragFrom.elemName + '"]':dragFrom.elemName;
+            const hlTo = chosenDeck!=""?'image[data-card="' + dragTo.elemName + '"]':dragTo.elemName;
+	    // Guard both lookups: hint targets an empty foundation via a
+	    // placeholder name ("#MTn") that has no element to highlight.
+	    const elFrom = document.querySelector(hlFrom);
+	    if(elFrom) elFrom.setAttribute("data-highlight","face");
+	    const elTo = document.querySelector(hlTo);
+	    if(elTo) elTo.setAttribute("data-highlight","face");
 	}
     }
 }
@@ -1328,6 +1401,8 @@ function initGame() {
     selectColour(rORb, colourLabel(rORb), undefined, true);
     selectTexture('felt', textureLabel('green'), undefined, true)
     startSolitaire();
+    // Convert image-deck cards to bitmaps in the background (see setCardArt)
+    setTimeout(rasterizeDeck, 50);
 }
 
 // Open/Close the target dropdown panel
